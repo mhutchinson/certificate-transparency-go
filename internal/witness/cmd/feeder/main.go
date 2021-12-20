@@ -43,21 +43,18 @@ var (
 	interval = flag.Duration("poll", 10*time.Second, "How quickly to poll the log to get updates")
 )
 
-// feeder contains a map from log IDs to ctLogs and a witness client.
-type feeder struct {
-	logs map[string]ctLog
-	w    wh.Witness
-}
-
 // ctLog contains the latest witnessed STH for a log and a log client.
 type ctLog struct {
+	id     string
 	desc   string
 	wsth   *ct.SignedTreeHead
 	client *client.LogClient
+
+	w *wh.Witness
 }
 
 // populateLogs populates a ctLog map based on the log list.
-func populateLogs(logListURL string) (map[string]ctLog, error) {
+func populateLogs(logListURL string, w *wh.Witness) (map[string]ctLog, error) {
 	resp, err := http.Get(logListURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to retrieve log list: %v", err)
@@ -82,8 +79,10 @@ func populateLogs(logListURL string) (map[string]ctLog, error) {
 				return nil, fmt.Errorf("failed to create log client: %v", err)
 			}
 			logs[logID] = ctLog{
+				id:     logID,
 				desc:   log.Description,
 				client: c,
+				w:      w,
 			}
 		}
 	}
@@ -117,58 +116,49 @@ func main() {
 		}
 	}
 	// Now set up the log data (with no initial witness STH).
-	ctLogs, err := populateLogs(*logList)
+	ctLogs, err := populateLogs(*logList, &w)
 	if err != nil {
 		glog.Exitf("Failed to set up log data: %v", err)
 	}
-	// Create the feeder.
-	f := feeder{
-		logs: ctLogs,
-		w:    w,
-	}
 	// Now feed each log.
 	wg := &sync.WaitGroup{}
-	for id, ld := range ctLogs {
+	for _, ld := range ctLogs {
 		wg.Add(1)
-		go func(f feeder, logName, id string) {
+		go func(l ctLog) {
 			defer wg.Done()
-			if err := f.feedLog(ctx, logName, id, *interval); err != nil {
+			if err := l.feed(ctx, *interval); err != nil {
 				glog.Errorf("feedLog: %v", err)
 			}
-		}(f, ld.desc, id)
+		}(ld)
 	}
 	wg.Wait()
 }
 
 // latestSize returns the size of the latest witness STH held by the feeder for
 // a given logID.
-func (f *feeder) latestSize(logID string) uint64 {
-	ld, ok := f.logs[logID]
-	if !ok {
-		return 0
-	}
-	if ld.wsth != nil {
-		return ld.wsth.TreeSize
+func (l *ctLog) latestSize() uint64 {
+	if l.wsth != nil {
+		return l.wsth.TreeSize
 	}
 	return 0
 }
 
 // feedLog feeds continuously for a given log, returning only when the context
 // is done.
-func (f *feeder) feedLog(ctx context.Context, logName, logID string, interval time.Duration) error {
+func (l *ctLog) feed(ctx context.Context, interval time.Duration) error {
 	tik := time.NewTicker(interval)
 	defer tik.Stop()
 	for {
 		func() {
-			wSize := f.latestSize(logID)
+			wSize := l.latestSize()
 			ctx, cancel := context.WithTimeout(ctx, interval)
 			defer cancel()
 
-			glog.V(2).Infof("Start feedOnce for %s (witness size %d)", logName, wSize)
-			if err := f.feedOnce(ctx, logID); err != nil {
-				glog.Warningf("Failed to feed for %s: %v", logName, err)
+			glog.V(2).Infof("Start feedOnce for %s (witness size %d)", l.desc, wSize)
+			if err := l.feedOnce(ctx); err != nil {
+				glog.Warningf("Failed to feed for %s: %v", l.desc, err)
 			}
-			glog.V(2).Infof("feedOnce complete for %s (witness size %d)", logName, wSize)
+			glog.V(2).Infof("feedOnce complete for %s (witness size %d)", l.desc, wSize)
 		}()
 
 		select {
@@ -181,14 +171,10 @@ func (f *feeder) feedLog(ctx context.Context, logName, logID string, interval ti
 
 // feedOnce attempts to update the STH held by the witness to the latest STH
 // provided by the log identified by logID.
-func (f *feeder) feedOnce(ctx context.Context, logID string) error {
-	ld, ok := f.logs[logID]
-	if !ok {
-		return fmt.Errorf("no data found for %s", logID)
-	}
+func (l *ctLog) feedOnce(ctx context.Context) error {
 	// Get and parse the latest STH from the log.
 	var sthResp ct.GetSTHResponse
-	_, csthRaw, err := ld.client.GetAndParse(ctx, ct.GetSTHPath, nil, &sthResp)
+	_, csthRaw, err := l.client.GetAndParse(ctx, ct.GetSTHPath, nil, &sthResp)
 	if err != nil {
 		return fmt.Errorf("failed to get latest STH: %v", err)
 	}
@@ -196,23 +182,23 @@ func (f *feeder) feedOnce(ctx context.Context, logID string) error {
 	if err != nil {
 		return fmt.Errorf("failed to parse response as STH: %v", err)
 	}
-	wSize := f.latestSize(logID)
+	wSize := l.latestSize()
 	if wSize >= csth.TreeSize {
-		glog.V(1).Infof("Witness size %d >= log size %d for %s - nothing to do", wSize, csth.TreeSize, ld.desc)
+		glog.V(1).Infof("Witness size %d >= log size %d for %s - nothing to do", wSize, csth.TreeSize, l.desc)
 		return nil
 	}
 
-	glog.Infof("Updating witness from size %d to %d for %s", wSize, csth.TreeSize, ld.desc)
+	glog.Infof("Updating witness from size %d to %d for %s", wSize, csth.TreeSize, l.desc)
 	// If we want to update the witness then let's get a consistency proof.
 	var pf [][]byte
 	if wSize > 0 {
-		pf, err = ld.client.GetSTHConsistency(ctx, wSize, csth.TreeSize)
+		pf, err = l.client.GetSTHConsistency(ctx, wSize, csth.TreeSize)
 		if err != nil {
 			return fmt.Errorf("failed to get consistency proof: %v", err)
 		}
 	}
 	// Now give the new STH and consistency proof to the witness.
-	wsthRaw, err := f.w.Update(ctx, logID, csthRaw, pf)
+	wsthRaw, err := l.w.Update(ctx, l.id, csthRaw, pf)
 	if err != nil && !errors.Is(err, wh.ErrSTHTooOld) {
 		return fmt.Errorf("failed to update STH: %v", err)
 	}
@@ -225,13 +211,6 @@ func (f *feeder) feedOnce(ctx context.Context, logID string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create STH: %v", err)
 	}
-	// For now just update our local state with whatever the witness
-	// returns, even if we got wh.ErrSTHTooOld.  This is fine if we're the
-	// only feeder for this witness.
-	f.logs[logID] = ctLog{
-		desc:   ld.desc,
-		wsth:   wsth,
-		client: ld.client,
-	}
+	l.wsth = wsth
 	return nil
 }
