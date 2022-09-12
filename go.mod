@@ -7,7 +7,7 @@ require (
 	github.com/fullstorydev/grpcurl v1.8.6
 	github.com/golang/glog v0.0.0-20160126235308-23def4e6c14b
 	github.com/golang/mock v1.6.0
-	github.com/google/go-cmp v0.5.8
+	github.com/google/go-cmp v0.5.9
 	github.com/google/trillian v1.4.1
 	github.com/gorilla/mux v1.8.0
 	github.com/kylelemons/godebug v1.1.0
